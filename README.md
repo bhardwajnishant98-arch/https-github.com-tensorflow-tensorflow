@@ -2,6 +2,8 @@
 
 A simple TensorFlow training example that trains a neural network on the MNIST dataset.
 
+This project is **Nishant's Neural Net (N3)**.
+
 ## Getting Started
 
 ### Prerequisites
