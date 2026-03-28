@@ -35,3 +35,7 @@ print("\nEvaluating model...")
 loss, accuracy = model.evaluate(x_test, y_test, verbose=2)
 print(f"\nTest accuracy: {accuracy:.4f}")
 print(f"Test loss:     {loss:.4f}")
+
+# Save the trained model for later use
+model.save("mnist_model.keras")
+print("\nModel saved to mnist_model.keras")
