@@ -7,6 +7,7 @@ with a confidence bar chart for all 10 digit classes.
 """
 
 import numpy as np
+from PIL import Image as PILImage
 import tensorflow as tf
 import gradio as gr
 
@@ -52,8 +53,6 @@ def predict(image):
 
     # Gradio Sketchpad/Image gives an RGB or RGBA numpy array.
     # Convert to grayscale, resize to 28×28, and normalise.
-    from PIL import Image as PILImage  # noqa: E402 – lazy import is fine here
-
     img = PILImage.fromarray(image.astype("uint8"))
     img = img.convert("L")  # grayscale
     img = img.resize((28, 28), PILImage.Resampling.LANCZOS)
