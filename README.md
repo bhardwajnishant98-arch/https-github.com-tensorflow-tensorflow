@@ -2,6 +2,8 @@
 
 A simple TensorFlow training example that trains a neural network on the MNIST dataset.
 
+This project is **Nishant's Neural Net (N3)**.
+
 ## Getting Started
 
 ### Prerequisites
@@ -20,6 +22,8 @@ pip install -r requirements.txt
 ```bash
 python train.py
 ```
+
+> Note: You can choose **any number** as input (where supported by the training script / configuration).
 
 ## GitHub Actions Workflow
 
