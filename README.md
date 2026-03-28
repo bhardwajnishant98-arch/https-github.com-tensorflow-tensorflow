@@ -23,7 +23,20 @@ pip install -r requirements.txt
 python train.py
 ```
 
-> Note: You can choose **any number** as input (where supported by the training script / configuration).
+### Run the Inference Visualisation UI
+
+Launch the Gradio web UI to draw or upload a digit and see the model's
+prediction along with per-class confidence scores:
+
+```bash
+python app.py
+```
+
+The app will train the model on startup and then open a local web page
+(by default at `http://127.0.0.1:7860`) where you can:
+
+1. **Draw** a digit (0-9) on the canvas or **upload** an image.
+2. Click **Predict** to see the predicted label and a confidence bar chart.
 
 ## GitHub Actions Workflow
 
