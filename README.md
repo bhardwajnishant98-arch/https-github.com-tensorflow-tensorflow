@@ -1,6 +1,6 @@
-# TensorFlow Training
+# Nishant's Neural Net (N3)
 
-A simple TensorFlow training example that trains a neural network on the MNIST dataset.
+A simple neural network training application built with TensorFlow that trains on the MNIST dataset.
 
 ## Getting Started
 
@@ -23,7 +23,7 @@ python train.py
 
 ## GitHub Actions Workflow
 
-The repository includes a GitHub Actions workflow (`.github/workflows/tensorflow_training.yml`) that automatically:
+The repository includes a GitHub Actions workflow (`.github/workflows/n3_training.yml`) that automatically:
 
 1. Sets up Python 3.10
 2. Installs TensorFlow

@@ -1,10 +1,13 @@
 """
-Simple TensorFlow training example.
+Nishant's Neural Net (N3)
 Trains a small neural network on the MNIST dataset.
 """
 
 import tensorflow as tf
 
+print("=" * 40)
+print("  Nishant's Neural Net (N3)")
+print("=" * 40)
 print(f"TensorFlow version: {tf.__version__}")
 
 # Load and preprocess the MNIST dataset
