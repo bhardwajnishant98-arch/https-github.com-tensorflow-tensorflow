@@ -1,0 +1,9 @@
+# Generated test images
+test_images/
+
+# Trained model
+mnist_model.keras
+
+# Python
+__pycache__/
+*.pyc
