@@ -3,15 +3,18 @@ Gradio UI for Nishant's Neural Net (N3) — MNIST digit recognition.
 
 Loads a pre-trained model from disk when available (fast startup) or
 trains the same architecture as train.py for 5 epochs and saves it for
-next time. Users can draw a digit (0-9) on a canvas or upload an image
-and see the model's prediction, a signal-flow visualisation of which
-neurons fired, and a confidence bar chart for all 10 digit classes.
+next time.  Users can draw a digit (0-9) on a canvas or click a test
+sample and see:
+  * the model's prediction & confidence,
+  * a signal-flow visualisation using *actual learned weights*,
+  * a gradient-descent analysis (saliency map + loss landscape).
 """
 
 import os
+import tempfile
 
 import matplotlib
-matplotlib.use("Agg")  # use non-interactive backend so plots work without a display
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image as PILImage
@@ -19,40 +22,25 @@ import tensorflow as tf
 import gradio as gr
 
 
-# ── Model ─────────────────────────────────────────────────────────────
+# -- Model -----------------------------------------------------------------
 
 def load_or_train_model():
-    """Load a saved model from disk, or train a new one and save it.
-
-    Caching explained for beginners:
-    - Training a neural network on 60,000 images takes time (roughly
-      30–60 seconds on a laptop).
-    - Once trained, the weights (the "knowledge" of the network) can be
-      saved to a file so we don't have to redo the work every time the
-      app starts.
-    - This function first checks whether that file already exists.
-      If it does, we simply load it — startup is nearly instant.
-      If it doesn't, we build and train the model (5 epochs for better
-      accuracy than the single-epoch train.py), then save it for next time.
-    """
+    """Load a saved model from disk, or train a new one and save it."""
     model_path = "mnist_model.keras"
 
     if os.path.exists(model_path):
-        print(f"Found saved model at '{model_path}' — loading it …")
+        print(f"Found saved model at '{model_path}' -- loading it ...")
         model = tf.keras.models.load_model(model_path)
         print("Model loaded.\n")
         return model
 
-    # No saved model found — build and train from scratch.
-    print("No saved model found. Training from scratch (5 epochs) …")
+    print("No saved model found. Training from scratch (5 epochs) ...")
     (x_train, y_train), _ = tf.keras.datasets.mnist.load_data()
-    # Divide by 255 to rescale pixel values from 0–255 to 0–1.
-    # Smaller, consistent input values help the network learn faster and
-    # more reliably (a process called "normalisation").
     x_train = x_train / 255.0
 
     model = tf.keras.models.Sequential([
-        tf.keras.layers.Flatten(input_shape=(28, 28)),
+        tf.keras.layers.Input(shape=(28, 28)),
+        tf.keras.layers.Flatten(),
         tf.keras.layers.Dense(128, activation="relu"),
         tf.keras.layers.Dropout(0.2),
         tf.keras.layers.Dense(10),
@@ -72,321 +60,509 @@ def load_or_train_model():
 
 model = load_or_train_model()
 
-# Build an "activation model" that exposes the output of every layer.
-# When we later call activation_model.predict(image), we get back a list
-# of arrays — one per layer — so we can see exactly which neurons fired
-# for a given input.  The last element in that list is the final logit
-# output (the raw scores before softmax).
+# Activation model -- exposes every layer's output for the signal-flow viz.
 activation_model = tf.keras.Model(
-    inputs=model.input,
+    inputs=model.inputs,
     outputs=[layer.output for layer in model.layers],
 )
 
+# Extract learned weight matrices for the signal-flow diagram.
+_dense_layers = [l for l in model.layers if isinstance(l, tf.keras.layers.Dense)]
+W1, _b1 = _dense_layers[0].get_weights()   # (784, 128)
+W2, _b2 = _dense_layers[1].get_weights()   # (128, 10)
 
-# ── Visualisation helpers ────────────────────────────────────────────
+
+# -- Sample MNIST test images ----------------------------------------------
+
+def _prepare_samples():
+    """Pick a diverse selection of MNIST test images (2 per digit)."""
+    _, (x_test, y_test) = tf.keras.datasets.mnist.load_data()
+
+    sample_dir = os.path.join(tempfile.gettempdir(), "n3_samples")
+    os.makedirs(sample_dir, exist_ok=True)
+
+    gallery_items = []
+    sample_rgb_arrays = []
+
+    for digit in range(10):
+        indices = np.where(y_test == digit)[0]
+        for pick in [0, len(indices) // 3]:
+            idx = indices[pick]
+            img_28 = x_test[idx]
+
+            pil_img = PILImage.fromarray(img_28, mode="L")
+            pil_big = pil_img.resize((112, 112), PILImage.Resampling.NEAREST)
+            path = os.path.join(sample_dir, f"sample_{digit}_{pick}.png")
+            pil_big.save(path)
+            gallery_items.append((path, f"Digit {digit}"))
+
+            rgb = np.stack([img_28] * 3, axis=-1)
+            sample_rgb_arrays.append(rgb)
+
+    return gallery_items, sample_rgb_arrays
+
+
+_gallery_items, _sample_rgb = _prepare_samples()
+
+
+# -- Visualisation helpers --------------------------------------------------
 
 CLASS_NAMES = [str(i) for i in range(10)]
 
 
 def _draw_network_signal(activations, probabilities):
-    """Draw a signal-flow diagram showing which neurons activated.
+    """Signal-flow diagram using actual weight x activation products.
 
-    Beginner explainer:
-    - A neural network passes numbers ("signals") from one layer of
-      neurons to the next.  Brighter circles mean a neuron fired more
-      strongly for this particular input.
-    - We show three columns: the flattened pixel values (784 neurons,
-      sampled down to 20 for readability), the hidden Dense-128 layer,
-      and the final 10 output neurons.
-    - Connecting lines between columns have their transparency (alpha)
-      set proportional to the source neuron's activation — strong
-      connections are easy to see, weak ones fade into the background.
-
-    Parameters
-    ----------
-    activations : list of numpy arrays
-        The per-layer activation arrays returned by activation_model.predict.
-    probabilities : numpy array of shape (10,)
-        Softmax-normalised output probabilities for the 10 digit classes.
-
-    Returns
-    -------
-    matplotlib.figure.Figure
-        The rendered signal-flow figure.
+    Deep-learning theory recap:
+      Forward pass through neuron j in a Dense layer:
+        pre_j = sum_i  W[i,j] * a_i  +  b_j
+        a_j   = ReLU(pre_j)
+      The contribution of source neuron i to target j is W[i,j] * a_i.
+      Positive contributions are excitatory (push up); negative are
+      inhibitory (push down).  The winner pathway is highlighted in amber.
     """
     bg = "#0f172a"
-    fig, ax = plt.subplots(figsize=(7, 5), facecolor=bg)
+    fig, ax = plt.subplots(figsize=(8, 6), facecolor=bg)
     ax.set_facecolor(bg)
     ax.axis("off")
 
-    # Layer indices: 0 = Flatten output (784,), 1 = Dense-128 (128,), last = Dense-10 (10,)
-    flatten_acts = activations[0].flatten()   # 784 values
-    dense_acts   = activations[1].flatten()   # 128 values
-    output_acts  = probabilities               # 10 values (already probabilities)
+    # Activations by layer type
+    flatten_acts = None
+    dense_acts = None
+    for i, layer in enumerate(model.layers):
+        if isinstance(layer, tf.keras.layers.Flatten):
+            flatten_acts = activations[i].flatten()
+        elif isinstance(layer, tf.keras.layers.Dense) and dense_acts is None:
+            dense_acts = activations[i].flatten()
 
-    # Sample a manageable number of neurons from each layer for display.
+    winner = int(np.argmax(probabilities))
+
+    # Sample neurons for display
     n_flat, n_dense, n_out = 20, 16, 10
     idx_flat  = np.linspace(0, len(flatten_acts) - 1, n_flat,  dtype=int)
-    idx_dense = np.linspace(0, len(dense_acts)   - 1, n_dense, dtype=int)
+    idx_dense = np.linspace(0, len(dense_acts) - 1,   n_dense, dtype=int)
 
     flat_sample  = flatten_acts[idx_flat]
     dense_sample = dense_acts[idx_dense]
-    out_sample   = output_acts
 
-    def _norm(arr):
-        """Normalise an array to [0, 1] for colour mapping."""
-        lo, hi = arr.min(), arr.max()
-        return (arr - lo) / (hi - lo + 1e-8)
+    # Actual weight contributions
+    W1_sub = W1[np.ix_(idx_flat, idx_dense)]          # (20, 16)
+    W2_sub = W2[idx_dense, :]                          # (16, 10)
 
-    flat_norm  = _norm(flat_sample)
-    dense_norm = _norm(dense_sample)
-    out_norm   = _norm(out_sample)
+    contrib1 = flat_sample[:, None] * W1_sub           # (20, 16)
+    contrib2 = dense_sample[:, None] * W2_sub          # (16, 10)
 
-    # x-positions for the three columns
-    xs = [0.15, 0.50, 0.85]
-    neuron_radius = 0.022
+    c1_abs = np.abs(contrib1)
+    c2_abs = np.abs(contrib2)
+    c1_max = c1_abs.max() + 1e-8
+    c2_max = c2_abs.max() + 1e-8
+
+    # Positions
+    xs = [0.12, 0.48, 0.84]
 
     def _ys(n):
-        """Return evenly-spaced y-coordinates for n neurons."""
-        return np.linspace(0.1, 0.9, n)
+        return np.linspace(0.08, 0.88, n)
 
     ys_flat  = _ys(n_flat)
     ys_dense = _ys(n_dense)
     ys_out   = _ys(n_out)
 
-    # Draw connecting lines between columns first (so circles sit on top).
-    for i, (y_src, strength) in enumerate(zip(ys_flat, flat_norm)):
-        for j, y_dst in enumerate(ys_dense):
+    # Connections: input -> hidden (weight x activation)
+    for i in range(n_flat):
+        for j in range(n_dense):
+            strength = c1_abs[i, j] / c1_max
+            if strength < 0.05:
+                continue
+            color = "#38bdf8" if contrib1[i, j] >= 0 else "#f87171"
             ax.plot(
-                [xs[0], xs[1]], [y_src, y_dst],
-                color="white", linewidth=0.3,
-                alpha=float(strength) * 0.35,
+                [xs[0], xs[1]], [ys_flat[i], ys_dense[j]],
+                color=color,
+                linewidth=0.3 + strength * 1.5,
+                alpha=float(np.clip(strength * 0.55, 0, 1)),
                 zorder=1,
             )
 
-    for i, (y_src, strength) in enumerate(zip(ys_dense, dense_norm)):
-        for j, y_dst in enumerate(ys_out):
+    # Connections: hidden -> output (highlight winner pathway)
+    for j in range(n_dense):
+        for k in range(n_out):
+            strength = c2_abs[j, k] / c2_max
+            is_winner = (k == winner)
+
+            if not is_winner and strength < 0.08:
+                continue
+
+            if is_winner:
+                color = "#fbbf24" if contrib2[j, k] >= 0 else "#fb923c"
+                alpha = float(np.clip(strength * 0.85 + 0.12, 0, 1))
+                lw = 0.6 + strength * 3.5
+            else:
+                color = "#38bdf8" if contrib2[j, k] >= 0 else "#f87171"
+                alpha = float(np.clip(strength * 0.25, 0, 1))
+                lw = 0.2 + strength * 0.8
+
             ax.plot(
-                [xs[1], xs[2]], [y_src, y_dst],
-                color="white", linewidth=0.4,
-                alpha=float(strength) * 0.5,
-                zorder=1,
+                [xs[1], xs[2]], [ys_dense[j], ys_out[k]],
+                color=color, linewidth=lw, alpha=alpha,
+                zorder=2 if is_winner else 1,
             )
 
-    # Draw neuron circles coloured by activation strength.
-    for y, strength in zip(ys_flat, flat_norm):
-        ax.add_patch(plt.Circle((xs[0], y), neuron_radius,
-                                color=plt.cm.plasma(float(strength)), zorder=2))
+    # Neuron circles
+    r = 0.018
 
-    for y, strength in zip(ys_dense, dense_norm):
-        ax.add_patch(plt.Circle((xs[1], y), neuron_radius,
-                                color=plt.cm.plasma(float(strength)), zorder=2))
+    flat_norm = flat_sample / (flat_sample.max() + 1e-8)
+    for y, v in zip(ys_flat, flat_norm):
+        ax.add_patch(plt.Circle(
+            (xs[0], y), r,
+            color=plt.cm.Blues(float(v) * 0.8 + 0.2),
+            ec="#475569", linewidth=0.3, zorder=3))
 
-    for y, strength in zip(ys_out, out_norm):
-        ax.add_patch(plt.Circle((xs[2], y), neuron_radius,
-                                color=plt.cm.plasma(float(strength)), zorder=2))
+    dense_norm = dense_sample / (dense_sample.max() + 1e-8)
+    for y, v in zip(ys_dense, dense_norm):
+        ax.add_patch(plt.Circle(
+            (xs[1], y), r,
+            color=plt.cm.cool(float(v)),
+            ec="#475569", linewidth=0.3, zorder=3))
 
-    # Column labels
-    for x, label in zip(xs, ["Input\n(pixels)", "Hidden\n(128)", "Output\n(10)"]):
-        ax.text(x, 0.97, label, ha="center", va="top", fontsize=8,
-                color="#94a3b8", fontweight="bold")
+    # Output neurons -- winner gets a bright glow
+    for k, (y, prob) in enumerate(zip(ys_out, probabilities)):
+        if k == winner:
+            ax.add_patch(plt.Circle((xs[2], y), r * 2.8,
+                                    color="#fbbf24", alpha=0.15, zorder=2))
+            ax.add_patch(plt.Circle((xs[2], y), r * 2.0,
+                                    color="#fbbf24", alpha=0.30, zorder=2))
+            ax.add_patch(plt.Circle((xs[2], y), r * 1.3,
+                                    color="#fbbf24", ec="#fbbf24",
+                                    linewidth=1.5, zorder=4))
+        else:
+            brightness = float(prob) * 0.5 + 0.15
+            ax.add_patch(plt.Circle(
+                (xs[2], y), r,
+                color=plt.cm.Greys(brightness),
+                ec="#475569", linewidth=0.3, zorder=3))
 
-    # Label the output neurons with digit names
-    for y, name in zip(ys_out, CLASS_NAMES):
-        ax.text(xs[2] + 0.06, y, name, ha="left", va="center",
-                fontsize=7, color="#cbd5e1")
+    # Labels
+    for x, label in zip(
+        xs,
+        ["Input\n(784->20 shown)", "Hidden\n(128->16 shown)", "Output\n(10 classes)"],
+    ):
+        ax.text(x, 0.96, label, ha="center", va="top",
+                fontsize=7, color="#94a3b8", fontweight="bold")
+
+    for k, (y, name) in enumerate(zip(ys_out, CLASS_NAMES)):
+        is_w = (k == winner)
+        ax.text(
+            xs[2] + 0.05, y,
+            f"{name}  ({probabilities[k]*100:.1f}%)",
+            ha="left", va="center", fontsize=7,
+            color="#fbbf24" if is_w else "#64748b",
+            fontweight="bold" if is_w else "normal",
+        )
+
+    # Legend
+    ax.plot([], [], color="#38bdf8", lw=2, label="Excitatory (+)")
+    ax.plot([], [], color="#f87171", lw=2, label="Inhibitory (-)")
+    ax.plot([], [], color="#fbbf24", lw=3, label=f"Winner path -> {winner}")
+    ax.legend(loc="lower center", fontsize=6, ncol=3,
+              facecolor="#1e293b", edgecolor="#334155",
+              labelcolor="#cbd5e1", framealpha=0.9)
 
     fig.tight_layout(pad=0.3)
     return fig
 
 
-def _draw_confidence_bar(probabilities):
-    """Draw a horizontal bar chart of the model's confidence for each digit.
+def _draw_gradient_analysis(arr_batch, predicted_class):
+    """Gradient-descent analysis for this specific input.
 
-    Beginner explainer:
-    - After the network produces raw scores (logits), we apply "softmax"
-      to turn them into probabilities that sum to 1 (100 %).
-    - This chart shows how confident the model is about each digit class.
-    - The winning class (highest bar) is highlighted in amber so it
-      stands out immediately.  All other bars are teal.
-    - Percentage labels are printed at the end of each bar.
+    Saliency map -- |dL/dx|.  Pixels with large gradient magnitude sit
+    on a steep slope of the loss surface.
 
-    Parameters
-    ----------
-    probabilities : numpy array of shape (10,)
-        Softmax-normalised probabilities for digits 0–9.
-
-    Returns
-    -------
-    matplotlib.figure.Figure
-        The rendered confidence bar chart figure.
+    Loss landscape slice -- perturb the input along the gradient direction:
+    x' = x + eps * (grad / ||grad||).  Positive eps goes uphill (loss
+    increases); negative eps goes downhill (gradient descent direction).
     """
-    bg       = "#0f172a"
-    teal     = "#2dd4bf"
-    amber    = "#fbbf24"
-    txt_col  = "#cbd5e1"
+    x = tf.constant(arr_batch, dtype=tf.float32)
 
-    winner = int(np.argmax(probabilities))
-    colors = [amber if i == winner else teal for i in range(10)]
-
-    fig, ax = plt.subplots(figsize=(5, 4), facecolor=bg)
-    ax.set_facecolor(bg)
-
-    y_pos = np.arange(10)
-    bars  = ax.barh(y_pos, probabilities * 100, color=colors, height=0.6)
-
-    # Percentage annotation at the right end of each bar
-    for bar, prob in zip(bars, probabilities):
-        ax.text(
-            bar.get_width() + 0.5, bar.get_y() + bar.get_height() / 2,
-            f"{prob * 100:.1f}%",
-            va="center", ha="left", fontsize=7, color=txt_col,
+    with tf.GradientTape() as tape:
+        tape.watch(x)
+        logits = model(x, training=False)
+        loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
+            labels=tf.constant([predicted_class]), logits=logits,
         )
 
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(CLASS_NAMES, color=txt_col, fontsize=9)
-    ax.set_xlabel("Confidence (%)", color=txt_col, fontsize=8)
-    ax.set_xlim(0, 115)
-    ax.tick_params(colors=txt_col)
-    for spine in ax.spines.values():
+    grad = tape.gradient(loss, x)
+
+    saliency = tf.abs(grad).numpy().squeeze()
+
+    grad_flat = tf.reshape(grad, [-1]).numpy()
+    grad_norm_val = np.linalg.norm(grad_flat) + 1e-8
+    grad_dir = grad_flat / grad_norm_val
+
+    x_flat = arr_batch.flatten()
+    current_loss = float(loss.numpy().item())
+
+    epsilons = np.linspace(-2.0, 2.0, 35)
+    losses = []
+    for eps in epsilons:
+        x_pert = np.clip(x_flat + eps * grad_dir, 0, 1).reshape(1, 28, 28)
+        logits_p = model(tf.constant(x_pert, dtype=tf.float32), training=False)
+        loss_p = tf.nn.sparse_softmax_cross_entropy_with_logits(
+            labels=tf.constant([predicted_class]), logits=logits_p,
+        )
+        losses.append(float(loss_p.numpy().item()))
+
+    bg  = "#0f172a"
+    txt = "#cbd5e1"
+    sub = "#94a3b8"
+
+    fig, (ax1, ax2) = plt.subplots(
+        1, 2, figsize=(9, 4), facecolor=bg,
+        gridspec_kw={"width_ratios": [1, 1.4]},
+    )
+
+    # Left -- saliency heatmap
+    ax1.set_facecolor(bg)
+    im = ax1.imshow(saliency, cmap="inferno", interpolation="bilinear")
+    ax1.set_title("Saliency Map  |dL/dpixel|", color=txt, fontsize=9, pad=8)
+    ax1.set_xlabel("Brighter = pixel matters more", color=sub, fontsize=7)
+    ax1.tick_params(colors=sub, labelsize=5)
+    cbar = plt.colorbar(im, ax=ax1, fraction=0.046, pad=0.04)
+    cbar.ax.tick_params(colors=sub, labelsize=5)
+
+    # Right -- loss landscape slice
+    ax2.set_facecolor(bg)
+    ax2.plot(epsilons, losses, color="#2dd4bf", linewidth=2.5, zorder=2)
+    ax2.fill_between(epsilons, losses, alpha=0.12, color="#2dd4bf")
+    ax2.scatter([0], [current_loss], color="#fbbf24", s=120, zorder=5,
+                edgecolors="white", linewidths=1.5)
+
+    loss_range = max(losses) - min(losses) + 1e-8
+    ax2.annotate(
+        f"Current loss = {current_loss:.3f}",
+        xy=(0, current_loss),
+        xytext=(0.5, current_loss + loss_range * 0.25),
+        fontsize=7, color="#fbbf24",
+        arrowprops=dict(arrowstyle="->", color="#fbbf24", lw=1.2),
+    )
+
+    # Arrow showing gradient-descent direction (toward -eps, lower loss)
+    descent_eps = -0.6
+    descent_idx = int(np.argmin(np.abs(np.array(epsilons) - descent_eps)))
+    descent_loss = losses[descent_idx]
+    ax2.annotate(
+        "", xy=(descent_eps, descent_loss), xytext=(0, current_loss),
+        arrowprops=dict(arrowstyle="-|>", color="#f87171", lw=2.2,
+                        mutation_scale=15),
+        zorder=4,
+    )
+    ax2.text(descent_eps - 0.15, descent_loss, "grad descent",
+             fontsize=7, color="#f87171", style="italic", ha="right")
+
+    ax2.set_title("Loss Landscape (along grad direction)", color=txt,
+                  fontsize=9, pad=8)
+    ax2.set_xlabel("eps (perturbation magnitude)", color=sub, fontsize=8)
+    ax2.set_ylabel("Cross-Entropy Loss", color=sub, fontsize=8)
+    ax2.tick_params(colors=sub, labelsize=7)
+    for spine in ax2.spines.values():
         spine.set_edgecolor("#334155")
 
-    fig.tight_layout(pad=0.5)
+    fig.suptitle(
+        f"Gradient Analysis -- predicted class '{predicted_class}'",
+        color=txt, fontsize=10, y=0.02, va="bottom",
+    )
+    fig.tight_layout(pad=0.5, rect=[0, 0.05, 1, 1])
     return fig
 
 
-# ── Inference ────────────────────────────────────────────────────────────────
+# -- Image extraction helper -----------------------------------------------
 
-def predict(image):
-    """Run the model on the provided image and return all outputs.
+def _extract_image(value):
+    """Robustly extract a numpy array from Sketchpad / Image / dict."""
+    if value is None:
+        return None
+    if isinstance(value, np.ndarray):
+        return value
+    if isinstance(value, dict):
+        composite = value.get("composite")
+        if composite is not None:
+            if isinstance(composite, np.ndarray):
+                return composite
+            if isinstance(composite, PILImage.Image):
+                return np.array(composite)
+            if isinstance(composite, str) and os.path.exists(composite):
+                return np.array(PILImage.open(composite))
+        layers = value.get("layers", [])
+        for layer_data in reversed(layers):
+            if isinstance(layer_data, np.ndarray):
+                return layer_data
+            if isinstance(layer_data, dict):
+                d = layer_data.get("data")
+                if isinstance(d, np.ndarray):
+                    return d
+    if isinstance(value, str) and os.path.exists(value):
+        return np.array(PILImage.open(value))
+    return None
 
-    Steps (with beginner explanations):
-    1. Convert to grayscale — MNIST is single-channel (black & white).
-       Colour information would just confuse a model trained on grey images.
-    2. Resize to 28×28 — the exact size the model was trained on.
-    3. Normalise to 0–1 — dividing by 255 rescales pixel values so the
-       network trains (and infers) faster and more reliably.
-    4. Invert if needed — MNIST digits are white on black.  If the user
-       draws on a white canvas, we flip the image so the digit is bright.
-    5. Run the activation model — captures every layer's output at once
-       so we can visualise the signal flow through the network.
-    6. Apply softmax — converts raw logit scores into probabilities that
-       sum to 1 (100 %), making them easy to interpret as "confidence".
 
-    Parameters
-    ----------
-    image : numpy array or None
-        RGB (or RGBA) image array provided by the Gradio canvas/upload.
+# -- Core prediction -------------------------------------------------------
 
-    Returns
-    -------
-    tuple
-        (predicted_label, confidences_dict, signal_flow_figure, bar_chart_figure)
-    """
+def _predict_core(image):
+    """Core prediction.  Accepts any numpy image; returns 4 outputs."""
     if image is None:
-        empty_fig1 = plt.figure(facecolor="#0f172a")
-        plt.close(empty_fig1)
-        empty_fig2 = plt.figure(facecolor="#0f172a")
-        plt.close(empty_fig2)
-        return (
-            "No image provided",
-            {c: 0.0 for c in CLASS_NAMES},
-            empty_fig1,
-            empty_fig2,
-        )
+        e1 = plt.figure(facecolor="#0f172a"); plt.close(e1)
+        e2 = plt.figure(facecolor="#0f172a"); plt.close(e2)
+        return "Draw or select an image", {c: 0.0 for c in CLASS_NAMES}, e1, e2
 
-    # Step 1 & 2: Grayscale + resize
     img = PILImage.fromarray(image.astype("uint8"))
-    img = img.convert("L")                          # grayscale — 1 channel
+    img = img.convert("L")
     img = img.resize((28, 28), PILImage.Resampling.LANCZOS)
 
-    # Step 3: Normalise — rescale 0–255 pixel values to 0–1
     arr = np.array(img, dtype="float32") / 255.0
 
-    # Step 4: Invert — MNIST digits are white on black; a white canvas
-    # would otherwise look like a blank image to the model.
     if arr.mean() > 0.5:
         arr = 1.0 - arr
 
-    arr = arr.reshape(1, 28, 28)
+    if arr.max() < 0.08:
+        e1 = plt.figure(facecolor="#0f172a"); plt.close(e1)
+        e2 = plt.figure(facecolor="#0f172a"); plt.close(e2)
+        return "No digit detected", {c: 0.0 for c in CLASS_NAMES}, e1, e2
 
-    # Step 5: Run the activation model to get all intermediate outputs.
-    all_activations = activation_model.predict(arr, verbose=0)
+    arr_batch = arr.reshape(1, 28, 28)
 
-    # The final layer's output contains the raw logit scores.
-    logits = all_activations[-1]
-
-    # Step 6: Softmax turns logits into probabilities (they sum to 1).
+    all_acts = activation_model.predict(arr_batch, verbose=0)
+    logits = all_acts[-1]
     probabilities = tf.nn.softmax(logits[0]).numpy()
 
-    predicted_label = CLASS_NAMES[int(np.argmax(probabilities))]
+    predicted_class = int(np.argmax(probabilities))
+    predicted_label = CLASS_NAMES[predicted_class]
     confidences = {c: float(probabilities[i]) for i, c in enumerate(CLASS_NAMES)}
 
-    signal_fig = _draw_network_signal(all_activations, probabilities)
-    bar_fig    = _draw_confidence_bar(probabilities)
+    signal_fig   = _draw_network_signal(all_acts, probabilities)
+    gradient_fig = _draw_gradient_analysis(arr_batch, predicted_class)
 
-    return predicted_label, confidences, signal_fig, bar_fig
+    return predicted_label, confidences, signal_fig, gradient_fig
 
 
-# ── UI ───────────────────────────────────────────────────────────────────────
+def predict_from_sketch(sketch_value):
+    """Handle Sketchpad input."""
+    image = _extract_image(sketch_value)
+    return _predict_core(image)
 
-with gr.Blocks(
-    title="Nishant's Neural Net (N3) — MNIST",
-    theme=gr.themes.Base(primary_hue="teal", neutral_hue="slate"),
-) as demo:
+
+def predict_from_sample(evt: gr.SelectData):
+    """Handle gallery sample click -- instantly predict."""
+    idx = evt.index
+    if 0 <= idx < len(_sample_rgb):
+        return _predict_core(_sample_rgb[idx])
+    return _predict_core(None)
+
+
+# -- UI --------------------------------------------------------------------
+
+with gr.Blocks(title="Nishant's Neural Net (N3) -- MNIST") as demo:
     gr.Markdown(
-        "## Nishant's Neural Net (N3) — MNIST Digit Recogniser\n"
-        "Draw a digit (0–9) on the canvas **or** upload an image, "
-        "then click **Predict** to see the model's output, signal-flow "
-        "diagram, and confidence chart."
+        "## Nishant's Neural Net (N3) -- MNIST Digit Recogniser\n"
+        "**Draw** a digit (0-9) on the canvas with your cursor, "
+        "**or** click any test sample below."
     )
 
     with gr.Row():
-        input_image = gr.Image(
-            label="Draw or upload a digit",
-            type="numpy",
-            image_mode="RGB",
-        )
-        with gr.Column():
+        with gr.Column(scale=2):
+            sketchpad = gr.Sketchpad(
+                label="Draw a digit with your cursor",
+                brush=gr.Brush(
+                    default_size=20,
+                    colors=["#000000"],
+                    default_color="#000000",
+                    color_mode="fixed",
+                ),
+                canvas_size=(280, 280),
+                image_mode="RGB",
+                type="numpy",
+            )
+            predict_btn = gr.Button("Predict", variant="primary", size="lg")
+
+        with gr.Column(scale=1):
             predicted_label  = gr.Label(label="Predicted digit")
-            confidence_chart = gr.Label(label="Class confidences", num_top_classes=10)
+            confidence_chart = gr.Label(
+                label="Class confidences", num_top_classes=10,
+            )
 
-    with gr.Row():
-        signal_plot = gr.Plot(label="Signal-flow through the network")
-        bar_plot    = gr.Plot(label="Confidence bar chart")
-
-    predict_btn = gr.Button("Predict", variant="primary")
-    predict_btn.click(
-        fn=predict,
-        inputs=input_image,
-        outputs=[predicted_label, confidence_chart, signal_plot, bar_plot],
+    gr.Markdown("### Test Samples -- click any digit to instantly predict")
+    sample_gallery = gr.Gallery(
+        value=_gallery_items,
+        label="MNIST Test Samples (2 per digit, mixed difficulty)",
+        columns=10,
+        rows=2,
+        height="auto",
     )
 
-    with gr.Accordion("ℹ️ How does this work?", open=False):
+    with gr.Row():
+        signal_plot   = gr.Plot(
+            label="Neural Network Signal Flow  (weight x activation)",
+        )
+        gradient_plot = gr.Plot(
+            label="Gradient Descent Analysis",
+        )
+
+    _outputs = [predicted_label, confidence_chart, signal_plot, gradient_plot]
+
+    predict_btn.click(
+        fn=predict_from_sketch, inputs=sketchpad, outputs=_outputs,
+    )
+    sample_gallery.select(
+        fn=predict_from_sample, inputs=None, outputs=_outputs,
+    )
+
+    with gr.Accordion("How does this work?", open=False):
         gr.Markdown(
+            "### Signal-Flow Diagram\n"
+            "Each connection line represents **W[i,j] x activation_i** -- "
+            "the *actual learned weight* multiplied by the neuron's current "
+            "activation.\n\n"
+            "| Colour | Meaning |\n"
+            "|--------|---------|\n"
+            "| **Cyan** | Excitatory (+) -- pushes the output *up* |\n"
+            "| **Red** | Inhibitory (-) -- pushes the output *down* |\n"
+            "| **Amber (thick)** | Winner pathway -- connections feeding "
+            "the predicted digit |\n\n"
+            "Thicker, brighter lines = larger |W*a| = stronger signal.  "
+            "The winning output neuron gets an amber glow so you can "
+            "instantly see *which* digit won and *why*.\n\n"
+            "### Gradient Descent Analysis\n"
+            "- **Saliency Map** -- |dLoss/dpixel| for every input pixel.  "
+            "Bright spots are where the loss surface is steepest: tiny "
+            "changes there would most alter the prediction.  Each input "
+            "creates a unique saliency pattern.\n"
+            "- **Loss Landscape** -- a 1-D slice of the loss surface along "
+            "the gradient direction.  The *yellow dot* is where the model "
+            "currently sits; the *red arrow* shows which way gradient "
+            "descent would step to reduce the loss.  Different inputs "
+            "produce different landscape shapes because the gradient "
+            "direction changes with the input.\n\n"
             "| Term | Meaning |\n"
             "|------|---------|\n"
-            "| **Neuron** | A single number in the network that receives inputs, "
-            "adds them up (with learned weights), and passes the result on. |\n"
-            "| **Dense layer** | Every neuron in this layer is connected to every "
-            "neuron in the previous layer — hence \"fully connected\" or \"dense\". |\n"
-            "| **ReLU** | *Rectified Linear Unit* — an activation function that "
-            "simply sets any negative value to 0.  It lets the network learn "
-            "non-linear patterns. |\n"
-            "| **Dropout** | During training, randomly silences 20 % of neurons "
-            "each step to prevent the network from memorising the training data "
-            "(a problem called *overfitting*). |\n"
-            "| **Softmax** | Converts raw output scores (logits) into probabilities "
-            "that sum to 1, so you can read them as confidence percentages. |\n"
-            "| **Epoch** | One full pass over the entire training dataset.  "
-            "More epochs → more learning, up to a point. |\n"
+            "| **Neuron** | A unit that sums weighted inputs and applies "
+            "an activation function. |\n"
+            "| **Weight (W)** | A learned scalar that scales a connection "
+            "between two neurons. |\n"
+            "| **ReLU** | max(0, x) -- passes positive signals, blocks "
+            "negatives. |\n"
+            "| **Softmax** | Converts raw scores to probabilities summing "
+            "to 100%. |\n"
+            "| **Gradient** | Direction of steepest increase in loss; "
+            "descent goes opposite. |\n"
+            "| **Saliency** | Input-pixel sensitivity -- which pixels the "
+            "model looks at most. |\n"
         )
 
     gr.Markdown(
         "---\n"
-        "*Model: simple dense network (N3) trained on MNIST "
-        "(same architecture as `train.py`).*"
+        "*Model: Dense(784->128->10) trained on MNIST for 5 epochs "
+        "(same architecture as train.py).*"
     )
 
 if __name__ == "__main__":
-    demo.launch(share=True, server_name="0.0.0.0")
+    demo.launch(
+        share=True,
+        server_name="0.0.0.0",
+    )

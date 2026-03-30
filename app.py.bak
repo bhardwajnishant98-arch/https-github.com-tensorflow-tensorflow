@@ -1,0 +1,393 @@
+"""
+Gradio UI for Nishant's Neural Net (N3) — MNIST digit recognition.
+
+Loads a pre-trained model from disk when available (fast startup) or
+trains the same architecture as train.py for 5 epochs and saves it for
+next time. Users can draw a digit (0-9) on a canvas or upload an image
+and see the model's prediction, a signal-flow visualisation of which
+neurons fired, and a confidence bar chart for all 10 digit classes.
+"""
+
+import os
+
+import matplotlib
+matplotlib.use("Agg")  # use non-interactive backend so plots work without a display
+import matplotlib.pyplot as plt
+import numpy as np
+from PIL import Image as PILImage
+import tensorflow as tf
+import gradio as gr
+
+
+# ── Model ─────────────────────────────────────────────────────────────
+
+def load_or_train_model():
+    """Load a saved model from disk, or train a new one and save it.
+
+    Caching explained for beginners:
+    - Training a neural network on 60,000 images takes time (roughly
+      30–60 seconds on a laptop).
+    - Once trained, the weights (the "knowledge" of the network) can be
+      saved to a file so we don't have to redo the work every time the
+      app starts.
+    - This function first checks whether that file already exists.
+      If it does, we simply load it — startup is nearly instant.
+      If it doesn't, we build and train the model (5 epochs for better
+      accuracy than the single-epoch train.py), then save it for next time.
+    """
+    model_path = "mnist_model.keras"
+
+    if os.path.exists(model_path):
+        print(f"Found saved model at '{model_path}' — loading it …")
+        model = tf.keras.models.load_model(model_path)
+        print("Model loaded.\n")
+        return model
+
+    # No saved model found — build and train from scratch.
+    print("No saved model found. Training from scratch (5 epochs) …")
+    (x_train, y_train), _ = tf.keras.datasets.mnist.load_data()
+    # Divide by 255 to rescale pixel values from 0–255 to 0–1.
+    # Smaller, consistent input values help the network learn faster and
+    # more reliably (a process called "normalisation").
+    x_train = x_train / 255.0
+
+    model = tf.keras.models.Sequential([
+        tf.keras.layers.Input(shape=(28, 28)),
+        tf.keras.layers.Flatten(),
+        tf.keras.layers.Dense(128, activation="relu"),
+        tf.keras.layers.Dropout(0.2),
+        tf.keras.layers.Dense(10),
+    ])
+
+    model.compile(
+        optimizer="adam",
+        loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        metrics=["accuracy"],
+    )
+
+    model.fit(x_train, y_train, epochs=5, verbose=2)
+    model.save(model_path)
+    print(f"\nModel saved to '{model_path}'.\n")
+    return model
+
+
+model = load_or_train_model()
+
+# Build an "activation model" that exposes the output of every layer.
+# When we later call activation_model.predict(image), we get back a list
+# of arrays — one per layer — so we can see exactly which neurons fired
+# for a given input.  The last element in that list is the final logit
+# output (the raw scores before softmax).
+activation_model = tf.keras.Model(
+    inputs=model.inputs,
+    outputs=[layer.output for layer in model.layers],
+)
+
+
+# ── Visualisation helpers ────────────────────────────────────────────
+
+CLASS_NAMES = [str(i) for i in range(10)]
+
+
+def _draw_network_signal(activations, probabilities):
+    """Draw a signal-flow diagram showing which neurons activated.
+
+    Beginner explainer:
+    - A neural network passes numbers ("signals") from one layer of
+      neurons to the next.  Brighter circles mean a neuron fired more
+      strongly for this particular input.
+    - We show three columns: the flattened pixel values (784 neurons,
+      sampled down to 20 for readability), the hidden Dense-128 layer,
+      and the final 10 output neurons.
+    - Connecting lines between columns have their transparency (alpha)
+      set proportional to the source neuron's activation — strong
+      connections are easy to see, weak ones fade into the background.
+
+    Parameters
+    ----------
+    activations : list of numpy arrays
+        The per-layer activation arrays returned by activation_model.predict.
+    probabilities : numpy array of shape (10,)
+        Softmax-normalised output probabilities for the 10 digit classes.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        The rendered signal-flow figure.
+    """
+    bg = "#0f172a"
+    fig, ax = plt.subplots(figsize=(7, 5), facecolor=bg)
+    ax.set_facecolor(bg)
+    ax.axis("off")
+
+    # Layer indices: 0 = Flatten output (784,), 1 = Dense-128 (128,), last = Dense-10 (10,)
+    flatten_acts = activations[0].flatten()   # 784 values
+    dense_acts   = activations[1].flatten()   # 128 values
+    output_acts  = probabilities               # 10 values (already probabilities)
+
+    # Sample a manageable number of neurons from each layer for display.
+    n_flat, n_dense, n_out = 20, 16, 10
+    idx_flat  = np.linspace(0, len(flatten_acts) - 1, n_flat,  dtype=int)
+    idx_dense = np.linspace(0, len(dense_acts)   - 1, n_dense, dtype=int)
+
+    flat_sample  = flatten_acts[idx_flat]
+    dense_sample = dense_acts[idx_dense]
+    out_sample   = output_acts
+
+    def _norm(arr):
+        """Normalise an array to [0, 1] for colour mapping."""
+        lo, hi = arr.min(), arr.max()
+        return (arr - lo) / (hi - lo + 1e-8)
+
+    flat_norm  = _norm(flat_sample)
+    dense_norm = _norm(dense_sample)
+    out_norm   = _norm(out_sample)
+
+    # x-positions for the three columns
+    xs = [0.15, 0.50, 0.85]
+    neuron_radius = 0.022
+
+    def _ys(n):
+        """Return evenly-spaced y-coordinates for n neurons."""
+        return np.linspace(0.1, 0.9, n)
+
+    ys_flat  = _ys(n_flat)
+    ys_dense = _ys(n_dense)
+    ys_out   = _ys(n_out)
+
+    # Draw connecting lines between columns first (so circles sit on top).
+    for i, (y_src, strength) in enumerate(zip(ys_flat, flat_norm)):
+        for j, y_dst in enumerate(ys_dense):
+            ax.plot(
+                [xs[0], xs[1]], [y_src, y_dst],
+                color="white", linewidth=0.3,
+                alpha=float(strength) * 0.35,
+                zorder=1,
+            )
+
+    for i, (y_src, strength) in enumerate(zip(ys_dense, dense_norm)):
+        for j, y_dst in enumerate(ys_out):
+            ax.plot(
+                [xs[1], xs[2]], [y_src, y_dst],
+                color="white", linewidth=0.4,
+                alpha=float(strength) * 0.5,
+                zorder=1,
+            )
+
+    # Draw neuron circles coloured by activation strength.
+    for y, strength in zip(ys_flat, flat_norm):
+        ax.add_patch(plt.Circle((xs[0], y), neuron_radius,
+                                color=plt.cm.plasma(float(strength)), zorder=2))
+
+    for y, strength in zip(ys_dense, dense_norm):
+        ax.add_patch(plt.Circle((xs[1], y), neuron_radius,
+                                color=plt.cm.plasma(float(strength)), zorder=2))
+
+    for y, strength in zip(ys_out, out_norm):
+        ax.add_patch(plt.Circle((xs[2], y), neuron_radius,
+                                color=plt.cm.plasma(float(strength)), zorder=2))
+
+    # Column labels
+    for x, label in zip(xs, ["Input\n(pixels)", "Hidden\n(128)", "Output\n(10)"]):
+        ax.text(x, 0.97, label, ha="center", va="top", fontsize=8,
+                color="#94a3b8", fontweight="bold")
+
+    # Label the output neurons with digit names
+    for y, name in zip(ys_out, CLASS_NAMES):
+        ax.text(xs[2] + 0.06, y, name, ha="left", va="center",
+                fontsize=7, color="#cbd5e1")
+
+    fig.tight_layout(pad=0.3)
+    return fig
+
+
+def _draw_confidence_bar(probabilities):
+    """Draw a horizontal bar chart of the model's confidence for each digit.
+
+    Beginner explainer:
+    - After the network produces raw scores (logits), we apply "softmax"
+      to turn them into probabilities that sum to 1 (100 %).
+    - This chart shows how confident the model is about each digit class.
+    - The winning class (highest bar) is highlighted in amber so it
+      stands out immediately.  All other bars are teal.
+    - Percentage labels are printed at the end of each bar.
+
+    Parameters
+    ----------
+    probabilities : numpy array of shape (10,)
+        Softmax-normalised probabilities for digits 0–9.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        The rendered confidence bar chart figure.
+    """
+    bg       = "#0f172a"
+    teal     = "#2dd4bf"
+    amber    = "#fbbf24"
+    txt_col  = "#cbd5e1"
+
+    winner = int(np.argmax(probabilities))
+    colors = [amber if i == winner else teal for i in range(10)]
+
+    fig, ax = plt.subplots(figsize=(5, 4), facecolor=bg)
+    ax.set_facecolor(bg)
+
+    y_pos = np.arange(10)
+    bars  = ax.barh(y_pos, probabilities * 100, color=colors, height=0.6)
+
+    # Percentage annotation at the right end of each bar
+    for bar, prob in zip(bars, probabilities):
+        ax.text(
+            bar.get_width() + 0.5, bar.get_y() + bar.get_height() / 2,
+            f"{prob * 100:.1f}%",
+            va="center", ha="left", fontsize=7, color=txt_col,
+        )
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(CLASS_NAMES, color=txt_col, fontsize=9)
+    ax.set_xlabel("Confidence (%)", color=txt_col, fontsize=8)
+    ax.set_xlim(0, 115)
+    ax.tick_params(colors=txt_col)
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#334155")
+
+    fig.tight_layout(pad=0.5)
+    return fig
+
+
+# ── Inference ────────────────────────────────────────────────────────────────
+
+def predict(image):
+    """Run the model on the provided image and return all outputs.
+
+    Steps (with beginner explanations):
+    1. Convert to grayscale — MNIST is single-channel (black & white).
+       Colour information would just confuse a model trained on grey images.
+    2. Resize to 28×28 — the exact size the model was trained on.
+    3. Normalise to 0–1 — dividing by 255 rescales pixel values so the
+       network trains (and infers) faster and more reliably.
+    4. Invert if needed — MNIST digits are white on black.  If the user
+       draws on a white canvas, we flip the image so the digit is bright.
+    5. Run the activation model — captures every layer's output at once
+       so we can visualise the signal flow through the network.
+    6. Apply softmax — converts raw logit scores into probabilities that
+       sum to 1 (100 %), making them easy to interpret as "confidence".
+
+    Parameters
+    ----------
+    image : numpy array or None
+        RGB (or RGBA) image array provided by the Gradio canvas/upload.
+
+    Returns
+    -------
+    tuple
+        (predicted_label, confidences_dict, signal_flow_figure, bar_chart_figure)
+    """
+    if image is None:
+        empty_fig1 = plt.figure(facecolor="#0f172a")
+        plt.close(empty_fig1)
+        empty_fig2 = plt.figure(facecolor="#0f172a")
+        plt.close(empty_fig2)
+        return (
+            "No image provided",
+            {c: 0.0 for c in CLASS_NAMES},
+            empty_fig1,
+            empty_fig2,
+        )
+
+    # Step 1 & 2: Grayscale + resize
+    img = PILImage.fromarray(image.astype("uint8"))
+    img = img.convert("L")                          # grayscale — 1 channel
+    img = img.resize((28, 28), PILImage.Resampling.LANCZOS)
+
+    # Step 3: Normalise — rescale 0–255 pixel values to 0–1
+    arr = np.array(img, dtype="float32") / 255.0
+
+    # Step 4: Invert — MNIST digits are white on black; a white canvas
+    # would otherwise look like a blank image to the model.
+    if arr.mean() > 0.5:
+        arr = 1.0 - arr
+
+    arr = arr.reshape(1, 28, 28)
+
+    # Step 5: Run the activation model to get all intermediate outputs.
+    all_activations = activation_model.predict(arr, verbose=0)
+
+    # The final layer's output contains the raw logit scores.
+    logits = all_activations[-1]
+
+    # Step 6: Softmax turns logits into probabilities (they sum to 1).
+    probabilities = tf.nn.softmax(logits[0]).numpy()
+
+    predicted_label = CLASS_NAMES[int(np.argmax(probabilities))]
+    confidences = {c: float(probabilities[i]) for i, c in enumerate(CLASS_NAMES)}
+
+    signal_fig = _draw_network_signal(all_activations, probabilities)
+    bar_fig    = _draw_confidence_bar(probabilities)
+
+    return predicted_label, confidences, signal_fig, bar_fig
+
+
+# ── UI ───────────────────────────────────────────────────────────────────────
+
+with gr.Blocks(
+    title="Nishant's Neural Net (N3) — MNIST",
+    theme=gr.themes.Base(primary_hue="teal", neutral_hue="slate"),
+) as demo:
+    gr.Markdown(
+        "## Nishant's Neural Net (N3) — MNIST Digit Recogniser\n"
+        "Draw a digit (0–9) on the canvas **or** upload an image, "
+        "then click **Predict** to see the model's output, signal-flow "
+        "diagram, and confidence chart."
+    )
+
+    with gr.Row():
+        input_image = gr.Image(
+            label="Draw or upload a digit",
+            type="numpy",
+            image_mode="RGB",
+        )
+        with gr.Column():
+            predicted_label  = gr.Label(label="Predicted digit")
+            confidence_chart = gr.Label(label="Class confidences", num_top_classes=10)
+
+    with gr.Row():
+        signal_plot = gr.Plot(label="Signal-flow through the network")
+        bar_plot    = gr.Plot(label="Confidence bar chart")
+
+    predict_btn = gr.Button("Predict", variant="primary")
+    predict_btn.click(
+        fn=predict,
+        inputs=input_image,
+        outputs=[predicted_label, confidence_chart, signal_plot, bar_plot],
+    )
+
+    with gr.Accordion("ℹ️ How does this work?", open=False):
+        gr.Markdown(
+            "| Term | Meaning |\n"
+            "|------|---------|\n"
+            "| **Neuron** | A single number in the network that receives inputs, "
+            "adds them up (with learned weights), and passes the result on. |\n"
+            "| **Dense layer** | Every neuron in this layer is connected to every "
+            "neuron in the previous layer — hence \"fully connected\" or \"dense\". |\n"
+            "| **ReLU** | *Rectified Linear Unit* — an activation function that "
+            "simply sets any negative value to 0.  It lets the network learn "
+            "non-linear patterns. |\n"
+            "| **Dropout** | During training, randomly silences 20 % of neurons "
+            "each step to prevent the network from memorising the training data "
+            "(a problem called *overfitting*). |\n"
+            "| **Softmax** | Converts raw output scores (logits) into probabilities "
+            "that sum to 1, so you can read them as confidence percentages. |\n"
+            "| **Epoch** | One full pass over the entire training dataset.  "
+            "More epochs → more learning, up to a point. |\n"
+        )
+
+    gr.Markdown(
+        "---\n"
+        "*Model: simple dense network (N3) trained on MNIST "
+        "(same architecture as `train.py`).*"
+    )
+
+if __name__ == "__main__":
+    demo.launch(share=True, server_name="0.0.0.0")
